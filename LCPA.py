@@ -8,12 +8,12 @@ LCPA - Local CV-improvement Path Analysis
 
 解析の流れ:
   1. Data_graph フォルダから指定問題の探索履歴 CSV を読み込む。
-  2. 設定に応じて、決定変数空間上で DBSCAN または HDBSCAN によりクラスタリングする。
-  3. クラスタリング有効時は、ノイズ点 / 極端に低密度な点を除去する。
-  4. 残った各個体について、自身より小さい CV を持つ個体のうち決定変数空間で
+  2. DENSITY_PERCENTILE > 0 の場合、決定変数空間で局所密度が低い孤立点を除去する。
+     (サンプリング不足による偽の局所最小 CV 点を除外するため。)
+  3. 残った各個体について、自身より小さい CV を持つ個体のうち決定変数空間で
      最も近い個体へエッジを張り、CV 改善グラフ (CV-improvement graph) を構築する。
-  5. 各ノードについて CV 改善先へのエッジ長 (決定変数空間距離) を計算する。
-  6. 縦軸 CV / 横軸 Edge Length の decision graph を作成する。
+  4. 各ノードについて CV 改善先へのエッジ長 (決定変数空間距離) を計算する。
+  5. 縦軸 CV / 横軸 Edge Length の decision graph を作成する。
 
 低 CV 領域で CV 改善先までの距離が大きい個体 = CV 改善のボトルネック候補。
 (候補は decision graph から目視で読み取る。自動検出は行わない。)
@@ -36,13 +36,6 @@ import matplotlib.pyplot as plt
 
 from scipy.spatial import cKDTree
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.cluster import DBSCAN
-
-try:
-    from sklearn.cluster import HDBSCAN as SK_HDBSCAN  # sklearn >= 1.3
-    _HAS_SK_HDBSCAN = True
-except Exception:  # pragma: no cover
-    _HAS_SK_HDBSCAN = False
 
 
 # ========================================================================== #
@@ -59,13 +52,8 @@ SCALER = "standard"          # 決定変数のスケーリング: "standard" / "
 NORMALIZE_CV = False          # 各制約を正規化してから CV を合算するか
 SEED = 0                     # サンプリング乱数シード
 
-# --- クラスタリング ---
-ENABLE_CLUSTERING = True     # True: クラスタリングでノイズ/低密度点を除去, False: 全点を使用
-CLUSTERER = "hdbscan"        # "hdbscan" / "dbscan"
-MIN_CLUSTER_SIZE = 25        # HDBSCAN の最小クラスタサイズ
-MIN_SAMPLES = None           # HDBSCAN / DBSCAN の min_samples (None で既定)
-EPS = None                   # DBSCAN の eps (None で自動推定)
-DENSITY_PERCENTILE = 5.0     # 除去する最低密度点の割合 [%]
+# --- 低密度点除去 ---
+DENSITY_PERCENTILE = 5.0     # 除去する最低密度点の割合 [%]。0 で無効 (全点を使用)
 DENSITY_K = 10               # 局所密度推定に用いる近傍数
 
 # --- グラフ / プロット ---
@@ -170,73 +158,31 @@ def load_history() -> History:
 
 
 # --------------------------------------------------------------------------- #
-# 2-3. クラスタリング & 低密度点除去
+# 2. 低密度点除去
 # --------------------------------------------------------------------------- #
-def cluster_and_filter(Xn: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """設定に応じてクラスタリングし、解析対象点のマスクを返す。
+def filter_low_density(Xn: np.ndarray) -> np.ndarray:
+    """局所密度が低い孤立点を除去し、残す点のマスクを返す。
+
+    DENSITY_PERCENTILE = 0 の場合は全点を残す。
+    サンプリング不足で孤立した点が偽の局所最小 CV 点として検出されるのを防ぐ。
 
     Returns
     -------
-    labels : np.ndarray
-        各点のクラスタラベル (ノイズは -1)。クラスタリング無効時は全点 0。
     keep : np.ndarray (bool)
         残す点のマスク (True = 残す)。
     """
     n = len(Xn)
-    if not ENABLE_CLUSTERING:
-        print(f"[cluster] disabled -> using all {n:,} individuals")
-        return np.zeros(n, dtype=np.int64), np.ones(n, dtype=bool)
+    if not DENSITY_PERCENTILE or DENSITY_PERCENTILE <= 0:
+        print(f"[filter] DENSITY_PERCENTILE=0 -> using all {n:,} individuals")
+        return np.ones(n, dtype=bool)
 
-    clusterer = CLUSTERER
-    print(f"[cluster] method={clusterer}, n={n:,}, dim={Xn.shape[1]}")
-
-    if clusterer == "hdbscan":
-        if not _HAS_SK_HDBSCAN:
-            print("[cluster] HDBSCAN 未対応の sklearn -> DBSCAN にフォールバック")
-            clusterer = "dbscan"
-        else:
-            model = SK_HDBSCAN(
-                min_cluster_size=MIN_CLUSTER_SIZE,
-                min_samples=MIN_SAMPLES,
-            )
-            labels = model.fit_predict(Xn)
-
-    if clusterer == "dbscan":
-        eps = EPS
-        if eps is None:
-            eps = _estimate_eps(Xn, k=MIN_SAMPLES or 4)
-            print(f"[cluster] DBSCAN eps を自動推定: {eps:.4g}")
-        model = DBSCAN(eps=eps, min_samples=MIN_SAMPLES or 4)
-        labels = model.fit_predict(Xn)
-    elif clusterer != "hdbscan":
-        raise ValueError(f"未知の CLUSTERER: {CLUSTERER}")
-
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = int((labels == -1).sum())
-    print(f"[cluster] clusters={n_clusters}, noise={n_noise:,} "
-          f"({100*n_noise/n:.1f}%)")
-
-    # --- 低密度点の追加除去 ---
-    # 各点の k-NN 距離 (= 局所密度の逆指標) を計算し、下位密度 (= 大きい距離) を除去。
-    keep = labels != -1
-    if DENSITY_PERCENTILE and DENSITY_PERCENTILE > 0:
-        kth = _kth_nn_distance(Xn, k=DENSITY_K)
-        # 距離が大きい = 低密度。上位 DENSITY_PERCENTILE% を除去。
-        thr = np.percentile(kth, 100.0 - DENSITY_PERCENTILE)
-        low_density = kth > thr
-        before = int(keep.sum())
-        keep = keep & (~low_density)
-        print(f"[cluster] low-density removal (>{DENSITY_PERCENTILE}% sparsest): "
-              f"{before:,} -> {int(keep.sum()):,}")
-
-    print(f"[cluster] kept individuals = {int(keep.sum()):,} / {n:,}")
-    return labels, keep
-
-
-def _estimate_eps(Xn: np.ndarray, k: int = 4) -> float:
-    """k-距離グラフ (90 パーセンタイル) から DBSCAN の eps を推定。"""
-    kth = _kth_nn_distance(Xn, k=k)
-    return float(np.percentile(kth, 90))
+    kth = _kth_nn_distance(Xn, k=DENSITY_K)
+    # 距離が大きい = 低密度。上位 DENSITY_PERCENTILE% を除去。
+    thr = np.percentile(kth, 100.0 - DENSITY_PERCENTILE)
+    keep = kth <= thr
+    print(f"[filter] low-density removal (sparsest {DENSITY_PERCENTILE}%): "
+          f"{n:,} -> {int(keep.sum()):,}")
+    return keep
 
 
 def _kth_nn_distance(Xn: np.ndarray, k: int = 10) -> np.ndarray:
@@ -464,7 +410,7 @@ def run() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
     hist = load_history()
-    labels, keep = cluster_and_filter(hist.Xn)
+    keep = filter_low_density(hist.Xn)
     graph = build_cv_improvement_graph(hist.Xn, hist.cv, keep)
 
     # 元データの情報を付与して保存
